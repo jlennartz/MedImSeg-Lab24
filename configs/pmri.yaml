@@ -1,3 +1,0 @@
-data_dir: "../../../../../data/PMRI/"
-vendor_assignment: {'train': 'ge', 'test': 'philips'}
-batch_size: 32

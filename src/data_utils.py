@@ -1,12 +1,10 @@
 import math
 import numpy as np
-from enum import Enum
 from typing import ( 
     List, 
     Tuple,
     Optional,
     Dict,
-    Union
 )
 import sys
 from time import sleep, time
@@ -16,12 +14,12 @@ import logging
 from threadpoolctl import threadpool_limits
 from queue import Queue as thrQueue
 import random
-from omegaconf import OmegaConf
 import torch
 from torch import Tensor
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import functional as F, InterpolationMode
+from omegaconf import OmegaConf
 from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances_argmin_min
 from batchgenerators.dataloading.data_loader import SlimDataLoaderBase
@@ -52,8 +50,6 @@ from batchgenerators.transforms.abstract_transforms import (
     Compose,
     AbstractTransform
 )
-from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
-from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.dataloading.multi_threaded_augmenter import producer, results_loop
 import lightning as L
 
@@ -61,50 +57,82 @@ from dataset import *
 
 
 
+def get_data_module(
+    cfg: OmegaConf
+):
+    if cfg.dataset == 'mnmv2':
+
+        return MNMv2DataModule(
+            data_dir=cfg.data_dir,
+            domain=cfg.domain,
+            batch_size=cfg.batch_size,
+            binary_target=cfg.binary_target,
+            non_empty_target=cfg.non_empty_target,
+            train_transforms=cfg.train_transforms
+        )
+
+    elif cfg.dataset == 'pmri':
+        return PMRIDataModule(
+            data_dir=cfg.data_dir,
+            domain=cfg.domain,
+            batch_size=cfg.batch_size,
+            train_transforms=cfg.train_transforms
+        )
+            
+
 class PMRIDataModule(L.LightningDataModule):
     
     def __init__(
         self,
         data_dir: str,
-        vendor_assignment: dict[str, str],
+        domain: str,
         batch_size: int = 32,
         train_transforms: str = 'global_transforms',
     ):
         super().__init__()
         self.data_dir = data_dir
-        self.vendor_assignment = vendor_assignment
+        self.domain = domain
         self.batch_size = batch_size
         self.train_transforms = train_transforms
         self.transforms = Transforms(patch_size=[384, 384])
+        self.pmri_train, self.pmri_val, self.pmri_test, self.pmri_predict = None, None, None, None
 
     def prepare_data(self):
         # nothing to prepare for now. Data already downloaded
         pass
 
     def setup(self, stage=None):
-        if stage == 'fit':
-            pmri_full = PMRIDataset(
-                data_dir=self.data_dir,
-                vendor=self.vendor_assignment['train'],
-            )
-            self.pmri_train, self.pmri_val = pmri_full.random_split(
-                val_size=0.1,
-            )
+        if stage == 'fit' or stage is None:
+            if self.pmri_train is None or self.pmri_val is None:
+                pmri_full = PMRIDataset(
+                    data_dir=self.data_dir,
+                    domain=self.domain,
+                )
+                self.pmri_train, self.pmri_val = pmri_full.random_split(
+                    val_size=0.1,
+                )
 
-        if stage == 'test':
-            self.pmri_test = PMRIDataset(
-                data_dir=self.data_dir,
-                vendor=self.vendor_assignment['test'],
-            )
+        if stage == 'test' or stage == 'predict' or stage is None:
+            if self.pmri_train is None or self.pmri_val is None:
+                pmri_full = PMRIDataset(
+                    data_dir=self.data_dir,
+                    domain=self.domain,
+                )
+                self.pmri_train, self.pmri_val = pmri_full.random_split(
+                    val_size=0.1,
+                )
 
-        if stage == 'predict':
-            self.prmi_predict = PMRIDataset(
-                data_dir=self.data_dir,
-                vendor=self.vendor_assignment['test'],
-            )
-
+            if self.pmri_test is None:
+                self.pmri_test = {}
+                for domain in ["RUNMC", "BMC", "I2CVB", "UCL", "BIDMC", "HK"]:
+                    if domain != self.domain:
+                        self.pmri_test[domain] = PMRIDataset(
+                            data_dir=self.data_dir,
+                            domain=domain,
+                        )
 
     def train_dataloader(self):
+        assert self.pmri_train is not None, "Data not loaded"
         pmri_train_loader = MultiImageSingleViewDataLoader(
             data=self.pmri_train,
             batch_size=self.batch_size,
@@ -114,13 +142,14 @@ class PMRIDataModule(L.LightningDataModule):
         return MultiThreadedAugmenter(
             data_loader=pmri_train_loader,
             transform=self.transforms.get_transforms(self.train_transforms),
-            num_processes=4,
-            num_cached_per_queue = 2, 
+            num_processes=1,
+            num_cached_per_queue = 4, 
             seeds=None
         )
     
     
     def val_dataloader(self):
+        assert self.pmri_val is not None, "Data not loaded"
         return DataLoader(
             self.pmri_val,
             batch_size=self.batch_size,
@@ -131,9 +160,27 @@ class PMRIDataModule(L.LightningDataModule):
         )
 
     
-    def test_dataloader(self):
-        return DataLoader(
-            self.pmri_test,
+    def test_dataloader(self, batch_size: int = None):
+        assert self.pmri_train is not None, "Data not loaded"
+        assert self.pmri_val is not None, "Data not loaded"
+        assert self.pmri_test is not None, "Data not loaded"
+
+        if batch_size is not None:
+            self.batch_size = batch_size
+
+        dataloaders = {}
+
+        dataloaders[f'{self.domain}_train'] = DataLoader(
+            self.pmri_train,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=True,
+            num_workers=4
+        )
+
+        dataloaders[f'{self.domain}_val'] = DataLoader(
+            self.pmri_val,
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=False,
@@ -141,24 +188,28 @@ class PMRIDataModule(L.LightningDataModule):
             num_workers=4
         )
     
+        for domain, dataset in self.pmri_test.items():
+            dataloaders[domain] = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=True,
+                num_workers=4
+            )
 
-    def predict_dataloader(self):
-        return DataLoader(
-            self.pmri_predict,
-            batch_size=self.batch_size,
-            shuffle=False,
-            drop_last=False,
-            pin_memory=True,
-            num_workers=4
-        )
+        return dataloaders
     
 
-
+    def predict_dataloader(self, batch_size: int = None):
+        return self.test_dataloader(batch_size=batch_size)
+    
+    
 class MNMv2DataModule(L.LightningDataModule):
     def __init__(
         self,
         data_dir: str,
-        vendor_assignment: dict,
+        domain: dict,
         batch_size: int = 32,
         binary_target: bool = False,
         train_transforms: str = 'global_transforms',
@@ -166,14 +217,13 @@ class MNMv2DataModule(L.LightningDataModule):
     ):
         super().__init__()
         self.data_dir = data_dir
-        self.vendor_assignment = vendor_assignment  # Should be a dict with keys 'train', 'val', 'test'
+        self.domain = domain  # Should be a dict with keys 'train', 'val', 'test'
         self.batch_size = batch_size
         self.train_transforms = train_transforms
         self.binary_target = binary_target
         self.non_empty_target = non_empty_target
-
         self.transforms = Transforms(patch_size=[256, 256])  # Assuming similar transform object as PMRIDataModule
-
+        self.mnm_train, self.mnm_val, self.mnm_test, self.mnm_predict = None, None, None, None
 
     def prepare_data(self):
         # Data is already prepared; nothing to do
@@ -182,37 +232,46 @@ class MNMv2DataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
-            # Load full dataset for training
-            mnm_full = MNMv2Dataset(
-                data_dir=self.data_dir,
-                vendor=self.vendor_assignment.get('train'),
-                binary_target=self.binary_target,
-                non_empty_target=self.non_empty_target,
-                normalize=True,  # Always normalizing
-            )
-            # Split using MNMv2Dataset's custom method
-            self.mnm_train, self.mnm_val = mnm_full.random_split(val_size=0.1)
+            if self.mnm_train is None or self.mnm_val is None:
+                mnm_full = MNMv2Dataset(
+                    data_dir=self.data_dir,
+                    domain=self.domain,
+                    binary_target=self.binary_target,
+                    non_empty_target=self.non_empty_target,
+                    normalize=True,  # Always normalizing
+                )
+                # Split using MNMv2Dataset's custom method
+                self.mnm_train, self.mnm_val = mnm_full.random_split(val_size=0.1)
 
-        if stage == 'test' or stage is None:
-            self.mnm_test = MNMv2Dataset(
-                data_dir=self.data_dir,
-                vendor=self.vendor_assignment.get('test'),
-                binary_target=self.binary_target,
-                non_empty_target=self.non_empty_target,
-                normalize=True,
-            )
+        if stage == 'test' or stage == 'predict' or stage is None:
+            if self.mnm_train is None or self.mnm_val is None:
+                mnm_full = MNMv2Dataset(
+                    data_dir=self.data_dir,
+                    domain=self.domain,
+                    binary_target=self.binary_target,
+                    non_empty_target=self.non_empty_target,
+                    normalize=True,  # Always normalizing
+                )
+                # Split using MNMv2Dataset's custom method
+                self.mnm_train, self.mnm_val = mnm_full.random_split(val_size=0.1)
 
-        if stage == 'predict' or stage is None:
-            self.mnm_predict = MNMv2Dataset(
-                data_dir=self.data_dir,
-                vendor=self.vendor_assignment.get('predict', self.vendor_assignment.get('test')),
-                binary_target=self.binary_target,
-                non_empty_target=self.non_empty_target,
-                normalize=True,
-            )
+            if self.mnm_test is None:
+                self.mnm_test = {}
+                for domain in ["Symphony", "Trio", "Avanto", "HDxt", "EXCITE", "Explorer", "Achieva"]:
+                    if domain.lower() != self.domain.lower():
+                        # print(f"Loading {domain} data")
+                        self.mnm_test[domain] = MNMv2Dataset(
+                            data_dir=self.data_dir,
+                            domain=domain,
+                            binary_target=self.binary_target,
+                            non_empty_target=self.non_empty_target,
+                            normalize=True,
+                        )
+            
 
 
     def train_dataloader(self):
+        assert self.mnm_train is not None, "Data not loaded"
         mnm_train_loader = MultiImageSingleViewDataLoader(
             data=self.mnm_train,
             batch_size=self.batch_size,
@@ -222,13 +281,13 @@ class MNMv2DataModule(L.LightningDataModule):
         return MultiThreadedAugmenter(
             data_loader=mnm_train_loader,
             transform=self.transforms.get_transforms(self.train_transforms),
-            num_processes=4,
-            num_cached_per_queue=2,
+            num_processes=1,
+            num_cached_per_queue=4,
             seeds=None
         )
 
-
     def val_dataloader(self):
+        assert self.mnm_val is not None, "Data not loaded"
         return DataLoader(
             self.mnm_val,
             batch_size=self.batch_size,
@@ -238,29 +297,49 @@ class MNMv2DataModule(L.LightningDataModule):
             drop_last=False  # Ensuring we do not drop the last batch
         )
 
+    def test_dataloader(self, batch_size: int = None):
+        assert self.mnm_train is not None, "Data not loaded"
+        assert self.mnm_val is not None, "Data not loaded"
+        assert self.mnm_test is not None, "Data not loaded"
 
-    def test_dataloader(self):
-        return DataLoader(
-            self.mnm_test,
+        if batch_size is not None:
+            self.batch_size = batch_size
+
+        dataloaders = {}
+
+        dataloaders[f'{self.domain}_train'] = DataLoader(
+            self.mnm_train,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=4,
             pin_memory=True,
-            drop_last=False  # Ensuring we do not drop the last batch
+            drop_last=False
         )
 
-
-    def predict_dataloader(self):
-        return DataLoader(
-            self.mnm_predict,
+        dataloaders[f'{self.domain}_val'] = DataLoader(
+            self.mnm_val,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=4,
             pin_memory=True,
-            drop_last=False  # Ensuring we do not drop the last batch
+            drop_last=False 
         )
 
+        for domain, dataset in self.mnm_test.items():
+            dataloaders[domain] = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                drop_last=False
+            )
 
+        return dataloaders
+    
+    
+    def predict_dataloader(self, batch_size: int = None):
+        return self.test_dataloader(batch_size=batch_size)
 
 
 
@@ -301,7 +380,43 @@ class SingleImageMultiViewDataLoader(SlimDataLoaderBase):
         return out
     
     
-
+class SingleImageMultiViewDataLoader(SlimDataLoaderBase):
+    """Single image multi view dataloader.
+    
+    Adapted from batchgenerator examples:
+    https://github.com/MIC-DKFZ/batchgenerators/blob/master/batchgenerators/examples/example_ipynb.ipynb
+    """
+    def __init__(
+        self, 
+        data: Dataset, 
+        batch_size: int, 
+        return_orig: str = True
+    ):
+        super(SingleImageMultiViewDataLoader, self).__init__(data, batch_size)
+        self.return_orig = return_orig
+    
+    def generate_train_batch(self):
+        # select single slice from dataset
+        data = self._data[random.randrange(len(self._data))]
+        # split into input and target, cast to np.float for batchgenerators
+        img = data['input'].numpy().astype(np.float32)
+        tar = data['target'][0].numpy().astype(np.float32)
+        # copy along batch dimension
+        img_batched = np.tile(img, (self.batch_size, 1, 1, 1))
+        tar_batched = np.tile(tar, (self.batch_size, 1, 1, 1))
+        # now construct the dictionary and return it. np.float32 cast because most networks take float
+        out = {'data': img_batched, 
+               'seg':  tar_batched}
+        
+        # if the original data is also needed, activate this flag to store it where augmentations
+        # cant find it.
+        if self.return_orig:
+            out['data_orig']   = data['input'].unsqueeze(0)
+            out['target_orig'] = data['target'].unsqueeze(0)
+        
+        return out
+    
+    
 class MultiImageSingleViewDataLoader(SlimDataLoaderBase):
     """Multi image single view dataloader.
     
@@ -325,10 +440,12 @@ class MultiImageSingleViewDataLoader(SlimDataLoaderBase):
         # split into input and target
         img    = data['input']
         tar    = data['target']
+        idx    = data['index']
         
         #construct the dictionary and return it. np.float32 cast because most networks take float
         out = {'data': img.numpy().astype(np.float32), 
-               'seg':  tar.numpy().astype(np.float32)}
+               'seg':  tar.numpy().astype(np.float32),
+               'index': idx.numpy().astype(np.float32)}
         
         # if the original data is also needed, activate this flag to store it where augmentations
         # cant find it.
@@ -339,7 +456,6 @@ class MultiImageSingleViewDataLoader(SlimDataLoaderBase):
         return out
     
     
-
 class Transforms(object):
     """
     A container for organizing and accessing different sets of image transformation operations.
@@ -367,9 +483,9 @@ class Transforms(object):
     
     def __init__(
         self,
-        patch_size = [256, 256]
+        patch_size: List[int]
     ) -> None:
-        
+        self.patch_size  = patch_size
         io_transforms = [
             RemoveLabelTransform(
                 output_key = 'seg', 
@@ -382,8 +498,13 @@ class Transforms(object):
                 out_key = 'target',
                 in_key = 'seg'
             ),
+            RenameTransform(
+                delete_old = True,
+                out_key = 'input',
+                in_key = 'data'
+            ),
             NumpyToTensor(
-                keys = ['data', 'target'], 
+                keys = ['input', 'target'], 
                 cast_to = 'float')    
         ]
        
@@ -416,7 +537,7 @@ class Transforms(object):
                 p_el_per_sample = 0.2, 
                 data_key = 'data', 
                 label_key = 'seg', 
-                patch_size = np.array(patch_size), 
+                patch_size = np.array(self.patch_size), 
                 patch_center_dist_from_border = None, 
                 do_elastic_deform = False, 
                 alpha = (0.0, 200.0), 
@@ -489,25 +610,25 @@ class Transforms(object):
             BrightnessGradientAdditiveTransform(
                 scale=200, 
                 max_strength=4, 
-                p_per_sample=0.2, 
+                p_per_sample=0.7, 
                 p_per_channel=1
             ),
             LocalGammaTransform(
                 scale=200, 
                 gamma=(2, 5), 
-                p_per_sample=0.2,
+                p_per_sample=0.7,
                 p_per_channel=1
             ),
             LocalSmoothingTransform(
                 scale=200,
                 smoothing_strength=(0.5, 1),
-                p_per_sample=0.2,
+                p_per_sample=0.7,
                 p_per_channel=1
             ),
             LocalContrastTransform(
                 scale=200,
                 new_contrast=(1, 3),
-                p_per_sample=0.2,
+                p_per_sample=0.7,
                 p_per_channel=1
             ),
         ]
@@ -538,7 +659,9 @@ class Transforms(object):
                     self.transforms['global_transforms']
                 )
             ))
-
+        
+        else:
+            raise ValueError(f"Unknown transform category {arg}. Must be one of {self.transforms.keys()}")
 
 
 def _apply_op(
@@ -633,7 +756,6 @@ def _apply_op(
     else:
         raise ValueError(f"The provided operator {op_name} is not recognized.")
     return img
-
 
 
 class RandAugmentWithLabels(torch.nn.Module):
@@ -762,13 +884,11 @@ class RandAugmentWithLabels(torch.nn.Module):
         )
         return s
 
-        
 
 def volume_collate(batch: List[dict]) -> dict:
     return batch[0]
-
-
      
+
 def slice_selection(
     dataset: Dataset, 
     indices: Tensor,
@@ -1065,3 +1185,4 @@ class MultiThreadedAugmenter(object):
         logging.debug("MultiThreadedGenerator: destructor was called")
         self._finish()
     
+
